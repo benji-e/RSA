@@ -1,0 +1,28 @@
+@ -0,0 +1,27 @@
+#import the math file to use  math.pow()
+import math
+
+
+#the d and n in the private key (n,d)
+d = 353
+n = 1271
+
+#a function to get the cypher text for each letter
+def mod(c):
+     # c = (m to the power e) mod n
+     result = math.pow(c,d)
+     divide = result % n
+     
+     #return the result
+     return divide
+
+#a function to apply the mod(m) on each number in the list
+def decypher(c:list):
+    for i in range(len(c)):
+         c[i] = mod(c[i])
+    
+    return c
+ 
+
+ #calling the function   
+print(decypher([1,2]))

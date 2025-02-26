@@ -1,0 +1,30 @@
+
+#Encryption program
+
+
+#import the math file to use  math.pow()
+import math
+
+#the e and n in the public key (n,e)
+e = 17
+n= 1271
+
+#a function to get the cypher text for each letter
+def mod(m):
+     # c = (m to the power e) mod n
+     result = math.pow(m,e)
+     divide = result % n
+     
+     #return the result
+     return divide
+
+#a function to apply the mod(m) on each number in the list
+def cypher(m:list):
+    for i in range(len(m)):
+         m[i] = mod(m[i])
+    
+    return m
+ 
+
+ #calling the function   
+print(cypher([]))

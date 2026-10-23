@@ -1,28 +1,275 @@
-@ -0,0 +1,27 @@
-#import the math file to use  math.pow()
-import math
+#!/usr/bin/env python3
+"""
+rsa_decrypt.py - A small, correct, and well-documented textbook-RSA toolkit.
+
+WHAT WAS WRONG WITH THE ORIGINAL
+--------------------------------
+`math.pow(c, d) % n` computes c**d as a *float* first. With d = 353 that number
+has hundreds of digits, floats only hold ~15-16 significant digits, so the
+result is silently wrong (or overflows). Python's built-in three-argument
+`pow(c, d, n)` does *modular exponentiation* on integers: it is exact, and it
+is fast because it never builds the giant number.
+
+WHAT THIS VERSION ADDS
+----------------------
+  * Exact integer maths (square-and-multiply via pow(c, d, n)).
+  * Input validation (ciphertext must satisfy 0 <= c < n).
+  * No mutation of the caller's list (the original overwrote it in place).
+  * Optional CRT decryption (~3-4x faster) when p and q are known.
+  * Recovery of p, q, phi(n) and the public exponent e from (n, d)
+    for small educational keys.
+  * Optional decoding of numbers to text (ASCII or A=1..Z=26).
+  * A matching encrypt() so you can round-trip test.
+  * A command line interface and a built-in self-test.
+
+NOTE: This is *textbook* RSA with tiny keys. It is for learning and coursework
+only. Real RSA needs 2048+ bit keys and padding (OAEP). Never use this to
+protect real data.
+
+Examples
+--------
+    python rsa_decrypt.py 1 2
+    python rsa_decrypt.py 1 2 --n 1271 --d 353 --decode alphabet
+    python rsa_decrypt.py --selftest
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Default key from the original script
+# --------------------------------------------------------------------------- #
+DEFAULT_N = 1271
+DEFAULT_D = 353
 
 
-#the d and n in the private key (n,d)
-d = 353
-n = 1271
+# --------------------------------------------------------------------------- #
+# Number theory helpers
+# --------------------------------------------------------------------------- #
+def factorize_semiprime(n: int) -> Tuple[int, int]:
+    """
+    Split n into two primes p * q by trial division.
 
-#a function to get the cypher text for each letter
-def mod(c):
-     # c = (m to the power e) mod n
-     result = math.pow(c,d)
-     divide = result % n
-     
-     #return the result
-     return divide
+    Fine for tiny classroom keys (n up to ~10^12 is instant). For real RSA
+    moduli this is hopeless - which is exactly why RSA is secure.
 
-#a function to apply the mod(m) on each number in the list
-def decypher(c:list):
-    for i in range(len(c)):
-         c[i] = mod(c[i])
-    
-    return c
- 
+    Raises ValueError if n is not a product of two distinct primes.
+    """
+    if n < 4:
+        raise ValueError(f"n={n} is too small to be an RSA modulus.")
 
- #calling the function   
-print(decypher([1,2]))
+    # Only need to test divisors up to sqrt(n).
+    divisor = 2
+    while divisor * divisor <= n:
+        if n % divisor == 0:
+            other = n // divisor
+            if other == divisor:
+                raise ValueError(f"n={n} is a perfect square (p == q); not valid RSA.")
+            return divisor, other
+        divisor += 1 if divisor == 2 else 2  # after 2, only try odd numbers
+
+    raise ValueError(f"n={n} is prime, so it cannot be an RSA modulus.")
+
+
+def modular_inverse(a: int, m: int) -> int:
+    """Return x such that (a * x) % m == 1. Raises ValueError if none exists."""
+    try:
+        return pow(a, -1, m)  # Python 3.8+
+    except ValueError:
+        raise ValueError(f"{a} has no inverse modulo {m} (they are not coprime).") from None
+
+
+# --------------------------------------------------------------------------- #
+# Key container
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class RSAPrivateKey:
+    """
+    An RSA private key (n, d), optionally with its prime factors p and q.
+
+    If p and q are present, CRT decryption is used automatically.
+    """
+    n: int
+    d: int
+    p: Optional[int] = None
+    q: Optional[int] = None
+
+    # -- construction helpers ------------------------------------------------
+    @classmethod
+    def from_n_d(cls, n: int, d: int, factor: bool = True) -> "RSAPrivateKey":
+        """
+        Build a key from (n, d). If factor=True we try to recover p and q so
+        that CRT and public-key recovery become available. If n is too big to
+        factor quickly, pass factor=False.
+        """
+        p = q = None
+        if factor:
+            try:
+                p, q = factorize_semiprime(n)
+            except ValueError:
+                pass  # fall back to plain decryption
+        return cls(n=n, d=d, p=p, q=q)
+
+    # -- derived values ------------------------------------------------------
+    @property
+    def phi(self) -> Optional[int]:
+        """Euler's totient phi(n) = (p-1)(q-1), if p and q are known."""
+        if self.p is None or self.q is None:
+            return None
+        return (self.p - 1) * (self.q - 1)
+
+    @property
+    def e(self) -> Optional[int]:
+        """The matching public exponent e, where e*d = 1 (mod phi)."""
+        return modular_inverse(self.d, self.phi) if self.phi else None
+
+    # -- core operations -----------------------------------------------------
+    def decrypt_int(self, c: int) -> int:
+        """Decrypt ONE ciphertext integer: m = c^d mod n."""
+        if not isinstance(c, int) or isinstance(c, bool):
+            raise TypeError(f"Ciphertext must be an int, got {type(c).__name__}.")
+        if not 0 <= c < self.n:
+            raise ValueError(f"Ciphertext {c} is out of range; need 0 <= c < {self.n}.")
+
+        if self.p and self.q:
+            return self._decrypt_crt(c)
+        return pow(c, self.d, self.n)
+
+    def _decrypt_crt(self, c: int) -> int:
+        """
+        Chinese Remainder Theorem decryption.
+
+        Instead of one big exponentiation mod n, do two small ones mod p and q
+        and stitch the answers together (Garner's formula).
+        """
+        p, q = self.p, self.q
+        dp = self.d % (p - 1)      # reduced exponent for the mod-p half
+        dq = self.d % (q - 1)      # reduced exponent for the mod-q half
+        q_inv = pow(q, -1, p)      # q^-1 mod p
+
+        m_p = pow(c % p, dp, p)    # c^d mod p
+        m_q = pow(c % q, dq, q)    # c^d mod q
+
+        h = (q_inv * (m_p - m_q)) % p
+        return m_q + h * q
+
+    def encrypt_int(self, m: int) -> int:
+        """Encrypt ONE plaintext integer (needs p and q to derive e)."""
+        if self.e is None:
+            raise ValueError("Cannot encrypt: p and q unknown, so e is unknown.")
+        if not 0 <= m < self.n:
+            raise ValueError(f"Message {m} is out of range; need 0 <= m < {self.n}.")
+        return pow(m, self.e, self.n)
+
+    def decrypt(self, ciphertext: Iterable[int]) -> List[int]:
+        """Decrypt a whole sequence. Returns a NEW list; input is untouched."""
+        return [self.decrypt_int(c) for c in ciphertext]
+
+    def encrypt(self, plaintext: Iterable[int]) -> List[int]:
+        """Encrypt a whole sequence. Returns a NEW list."""
+        return [self.encrypt_int(m) for m in plaintext]
+
+
+# --------------------------------------------------------------------------- #
+# Number -> text decoding
+# --------------------------------------------------------------------------- #
+def decode_numbers(numbers: Iterable[int], scheme: str) -> str:
+    """
+    Turn decrypted integers into readable text.
+
+    scheme:
+      "ascii"    -> each number is a character code (65 -> 'A')
+      "alphabet" -> 1..26 -> 'A'..'Z', 0 -> space
+    Anything that doesn't map cleanly becomes '?'.
+    """
+    out = []
+    for num in numbers:
+        if scheme == "ascii":
+            out.append(chr(num) if 0 <= num < 0x110000 else "?")
+        elif scheme == "alphabet":
+            if num == 0:
+                out.append(" ")
+            elif 1 <= num <= 26:
+                out.append(chr(ord("A") + num - 1))
+            else:
+                out.append("?")
+        else:
+            raise ValueError(f"Unknown decode scheme: {scheme!r}")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Self-test
+# --------------------------------------------------------------------------- #
+def selftest() -> bool:
+    """Round-trip every valid message and compare CRT, plain pow, and encrypt."""
+    key = RSAPrivateKey.from_n_d(DEFAULT_N, DEFAULT_D)
+    plain_key = RSAPrivateKey(n=DEFAULT_N, d=DEFAULT_D)  # no p,q -> no CRT
+
+    ok = True
+    for m in range(DEFAULT_N):
+        c = key.encrypt_int(m)
+        if key.decrypt_int(c) != m or plain_key.decrypt_int(c) != m:
+            print(f"FAIL at m={m}")
+            ok = False
+            break
+
+    print(f"p={key.p}, q={key.q}, phi={key.phi}, e={key.e}")
+    print("Self-test:", "PASSED (all messages round-trip)" if ok else "FAILED")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# Command line interface
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Decrypt textbook-RSA ciphertext numbers.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("ciphertext", nargs="*", type=int,
+                        help="Ciphertext integers to decrypt.")
+    parser.add_argument("--n", type=int, default=DEFAULT_N, help="Modulus n.")
+    parser.add_argument("--d", type=int, default=DEFAULT_D, help="Private exponent d.")
+    parser.add_argument("--decode", choices=["ascii", "alphabet"],
+                        help="Also show the plaintext as text.")
+    parser.add_argument("--no-factor", action="store_true",
+                        help="Skip factoring n (use for large n).")
+    parser.add_argument("--selftest", action="store_true",
+                        help="Run the built-in round-trip test and exit.")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.selftest:
+        return 0 if selftest() else 1
+
+    # With no arguments, reproduce the original script's demo: decrypt [1, 2].
+    ciphertext = args.ciphertext or [1, 2]
+
+    key = RSAPrivateKey.from_n_d(args.n, args.d, factor=not args.no_factor)
+
+    try:
+        plaintext = key.decrypt(ciphertext)
+    except (ValueError, TypeError) as err:
+        print(f"Error: {err}", file=sys.stderr)
+        return 1
+
+    print(f"Key      : n={key.n}, d={key.d}"
+          + (f"  (p={key.p}, q={key.q}, e={key.e})" if key.p else ""))
+    print(f"Method   : {'CRT' if key.p else 'plain modular exponentiation'}")
+    print(f"Cipher   : {ciphertext}")
+    print(f"Plain    : {plaintext}")
+    if args.decode:
+        print(f"Text     : {decode_numbers(plaintext, args.decode)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

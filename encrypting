@@ -1,30 +1,278 @@
+#!/usr/bin/env python3
+"""
+rsa_encrypt.py - Textbook RSA encryption, done properly. Partner to rsa_decrypt.py.
 
-#Encryption program
+WHAT WAS WRONG WITH THE ORIGINAL
+--------------------------------
+`math.pow(m, e) % n` builds m**e as a *float* first. Floats keep only ~15-16
+significant digits, so for many messages the result is silently wrong (and for
+big numbers it overflows). Python's three-argument `pow(m, e, n)` does exact
+integer *modular exponentiation*, never builds the giant number, and is fast.
+
+The original also overwrote the caller's list in place and was called with an
+empty list, so it printed nothing useful. Fixed.
+
+WHAT THIS VERSION ADDS
+----------------------
+  * Exact integer maths via pow(m, e, n).
+  * Encrypts numbers OR text (--text) using "ascii" or "alphabet" encoding,
+    matching the decode schemes in rsa_decrypt.py.
+  * Validates the public key (n >= 4, e >= 3, e coprime to phi(n) when n can be
+    factored) and every message (0 <= m < n).
+  * Warns about the "fixed points" of RSA: 0 and 1 encrypt to themselves.
+  * --explain shows the square-and-multiply steps behind each encryption,
+    so you can see exactly how pow(m, e, n) works.
+  * --verify-d D decrypts every result back with the private exponent and
+    confirms the round trip.
+  * No mutation of inputs; clean CLI; built-in self-test.
+
+NOTE: This is *textbook* RSA with a tiny key, for learning and coursework only.
+It is deterministic (same input -> same output) and unpadded, so it is NOT
+secure. Real RSA uses 2048+ bit keys and OAEP padding.
+
+Examples
+--------
+    python rsa_encrypt.py                         # demo, same key as before
+    python rsa_encrypt.py 1 2 65                  # encrypt numbers
+    python rsa_encrypt.py --text "HELLO" --scheme alphabet
+    python rsa_encrypt.py --text "Hi" --scheme ascii --verify-d 353
+    python rsa_encrypt.py 5 --explain
+    python rsa_encrypt.py --selftest
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from math import gcd
+from typing import Iterable, List, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Default public key from the original script
+# --------------------------------------------------------------------------- #
+DEFAULT_N = 1271
+DEFAULT_E = 17
 
 
-#import the math file to use  math.pow()
-import math
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def try_factor(n: int) -> Optional[Tuple[int, int]]:
+    """
+    Try to split n = p * q by trial division. Returns (p, q) or None.
 
-#the e and n in the public key (n,e)
-e = 17
-n= 1271
+    Only used to sanity-check small classroom keys. For real RSA moduli this
+    would never finish - which is the whole point of RSA - so we cap the work.
+    """
+    if n < 4:
+        return None
+    limit = min(int(n ** 0.5) + 1, 5_000_000)   # cap: don't hang on big n
+    if n % 2 == 0:
+        return (2, n // 2) if n // 2 != 2 else None
+    for f in range(3, limit, 2):
+        if n % f == 0:
+            return (f, n // f) if n // f != f else None
+    return None
 
-#a function to get the cypher text for each letter
-def mod(m):
-     # c = (m to the power e) mod n
-     result = math.pow(m,e)
-     divide = result % n
-     
-     #return the result
-     return divide
 
-#a function to apply the mod(m) on each number in the list
-def cypher(m:list):
-    for i in range(len(m)):
-         m[i] = mod(m[i])
-    
-    return m
- 
+def encode_text(text: str, scheme: str) -> List[int]:
+    """
+    Turn text into integers ready for encryption.
 
- #calling the function   
-print(cypher([]))
+    scheme "ascii"    : each character becomes its code point ('A' -> 65)
+    scheme "alphabet" : A..Z -> 1..26, space -> 0 (case-insensitive)
+    """
+    numbers = []
+    for ch in text:
+        if scheme == "ascii":
+            numbers.append(ord(ch))
+        elif scheme == "alphabet":
+            if ch == " ":
+                numbers.append(0)
+            elif ch.isascii() and ch.isalpha():
+                numbers.append(ord(ch.upper()) - ord("A") + 1)
+            else:
+                raise ValueError(
+                    f"Character {ch!r} can't be encoded with 'alphabet' "
+                    "(use only letters and spaces, or --scheme ascii)."
+                )
+        else:
+            raise ValueError(f"Unknown scheme: {scheme!r}")
+    return numbers
+
+
+# --------------------------------------------------------------------------- #
+# Public key
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class RSAPublicKey:
+    """An RSA public key (n, e)."""
+    n: int
+    e: int
+
+    def __post_init__(self) -> None:
+        """Validate the key the moment it is created."""
+        if self.n < 4:
+            raise ValueError(f"n={self.n} is too small to be an RSA modulus.")
+        if self.e < 3 or self.e >= self.n:
+            raise ValueError(f"e={self.e} is invalid; need 3 <= e < n.")
+
+        # If n is small enough to factor, confirm e is usable: it must be
+        # coprime to phi(n), otherwise no private key d can ever exist.
+        factors = try_factor(self.n)
+        if factors:
+            p, q = factors
+            phi = (p - 1) * (q - 1)
+            if gcd(self.e, phi) != 1:
+                raise ValueError(
+                    f"e={self.e} shares a factor with phi(n)={phi}; "
+                    "this key can't be decrypted. Choose a different e."
+                )
+
+    # -- core operations -----------------------------------------------------
+    def encrypt_int(self, m: int) -> int:
+        """Encrypt ONE integer: c = m^e mod n."""
+        if not isinstance(m, int) or isinstance(m, bool):
+            raise TypeError(f"Message must be an int, got {type(m).__name__}.")
+        if not 0 <= m < self.n:
+            raise ValueError(f"Message {m} is out of range; need 0 <= m < {self.n}.")
+        return pow(m, self.e, self.n)
+
+    def encrypt(self, messages: Iterable[int]) -> List[int]:
+        """Encrypt a whole sequence. Returns a NEW list; input is untouched."""
+        return [self.encrypt_int(m) for m in messages]
+
+    def explain(self, m: int) -> List[str]:
+        """
+        Walk through square-and-multiply for m^e mod n, step by step.
+
+        This is what pow(m, e, n) does internally: scan the bits of e from the
+        top, square at every bit, and multiply by m whenever the bit is 1.
+        """
+        if not 0 <= m < self.n:
+            raise ValueError(f"Message {m} is out of range; need 0 <= m < {self.n}.")
+        bits = bin(self.e)[2:]
+        lines = [f"m = {m}, e = {self.e} = 0b{bits}, n = {self.n}"]
+        result = 1
+        for i, bit in enumerate(bits):
+            result = (result * result) % self.n
+            action = "square"
+            if bit == "1":
+                result = (result * m) % self.n
+                action = "square, multiply by m"
+            lines.append(f"  bit {i} = {bit}: {action:<22} -> {result}")
+        assert result == pow(m, self.e, self.n)  # trust, but verify
+        lines.append(f"  => ciphertext = {result}")
+        return lines
+
+
+# --------------------------------------------------------------------------- #
+# Verification against a private key
+# --------------------------------------------------------------------------- #
+def verify_round_trip(key: RSAPublicKey, d: int, messages: List[int],
+                      ciphertext: List[int]) -> bool:
+    """Decrypt every ciphertext with d and confirm we get the messages back."""
+    return [pow(c, d, key.n) for c in ciphertext] == messages
+
+
+# --------------------------------------------------------------------------- #
+# Self-test
+# --------------------------------------------------------------------------- #
+def selftest() -> bool:
+    """
+    1. Every message 0..n-1 must encrypt exactly like the reference pow().
+    2. With the known private key (d=353) every message must round-trip.
+    3. The old float method is run to show how many answers it got WRONG.
+    """
+    import math
+
+    key = RSAPublicKey(DEFAULT_N, DEFAULT_E)
+    d = 353
+    ok = True
+    float_wrong = 0
+
+    for m in range(key.n):
+        c = key.encrypt_int(m)
+        if c != (m ** key.e) % key.n or pow(c, d, key.n) != m:
+            print(f"FAIL at m={m}")
+            ok = False
+            break
+        if int(math.pow(m, key.e) % key.n) != c:
+            float_wrong += 1
+
+    print("Self-test:", "PASSED (all messages round-trip)" if ok else "FAILED")
+    print(f"Old float method disagreed on {float_wrong} of {key.n} messages.")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# Command line interface
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Encrypt numbers or text with textbook RSA.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("numbers", nargs="*", type=int,
+                        help="Integers to encrypt (each must be < n).")
+    parser.add_argument("--text", help="Encrypt this text instead of numbers.")
+    parser.add_argument("--scheme", choices=["ascii", "alphabet"], default="ascii",
+                        help="How --text is turned into numbers.")
+    parser.add_argument("--n", type=int, default=DEFAULT_N, help="Modulus n.")
+    parser.add_argument("--e", type=int, default=DEFAULT_E, help="Public exponent e.")
+    parser.add_argument("--explain", action="store_true",
+                        help="Show square-and-multiply steps for each message.")
+    parser.add_argument("--verify-d", type=int, metavar="D",
+                        help="Private exponent; decrypt the result to confirm it.")
+    parser.add_argument("--selftest", action="store_true",
+                        help="Run the built-in tests and exit.")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.selftest:
+        return 0 if selftest() else 1
+
+    try:
+        key = RSAPublicKey(args.n, args.e)
+
+        if args.text is not None:
+            messages = encode_text(args.text, args.scheme)
+        else:
+            # No input at all -> demo, like the original script's example call.
+            messages = args.numbers or [1, 2]
+
+        ciphertext = key.encrypt(messages)
+    except (ValueError, TypeError) as err:
+        print(f"Error: {err}", file=sys.stderr)
+        return 1
+
+    print(f"Key      : n={key.n}, e={key.e}")
+    if args.text is not None:
+        print(f"Text     : {args.text!r} ({args.scheme})")
+    print(f"Plain    : {messages}")
+    print(f"Cipher   : {ciphertext}")
+
+    # RSA's weak spots: these messages are their own ciphertext.
+    fixed = sorted({m for m in messages if m in (0, 1)})
+    if fixed:
+        print(f"Warning  : {fixed} encrypt to themselves (RSA fixed points).")
+
+    if args.explain:
+        print("\nHow it works:")
+        for m in messages:
+            print("\n".join(key.explain(m)))
+
+    if args.verify_d is not None:
+        good = verify_round_trip(key, args.verify_d, messages, ciphertext)
+        print(f"Verified : {'YES, decrypts back to the original' if good else 'NO, d does not match this key'}")
+        if not good:
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
